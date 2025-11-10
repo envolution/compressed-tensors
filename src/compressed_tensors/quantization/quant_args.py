@@ -407,7 +407,9 @@ class QuantizationArgs(BaseModel, use_enum_values=True):
 
 
 def round_to_quantized_type_dtype(
-    tensor: torch.Tensor, dtype: torch.dtype
+    tensor: torch.Tensor,
+    dtype: torch.dtype,
+    cast_to_original_dtype: Optional[bool] = True,
 ) -> torch.Tensor:
     """
     Rounds an input tensor to the nearest quantized representation given a dtype.
@@ -415,6 +417,8 @@ def round_to_quantized_type_dtype(
 
     :param tensor: tensor to round
     :param dtype: dtype to use for rounding
+    :param cast_to_original_dtype: whether or not we cast the rounded tensor to
+        the original dtype
     :return: rounded tensor
     """
     original_dtype = tensor.dtype
@@ -425,7 +429,9 @@ def round_to_quantized_type_dtype(
         iinfo = torch.iinfo(dtype)
         rounded = torch.round(torch.clamp(tensor, iinfo.min, iinfo.max))
 
-    return rounded.to(original_dtype)
+    if cast_to_original_dtype:
+        return rounded.to(original_dtype)
+    return rounded
 
 
 def round_to_quantized_type_args(
@@ -433,6 +439,7 @@ def round_to_quantized_type_args(
     args: QuantizationArgs,
     min: torch.Tensor,
     max: torch.Tensor,
+    cast_to_original_dtype: Optional[bool] = True,
 ) -> torch.Tensor:
     """
     Rounds an input tensor to the nearest quantized representation given
@@ -442,6 +449,8 @@ def round_to_quantized_type_args(
     :param args: quantization args to use for rounding
     :param min: min value to use for clamping
     :param max: max value to use for clamping
+    :param cast_to_original_dtype: whether or not we cast the rounded tensor to
+        the original dtype
     :return: rounded tensor
     """
 
@@ -459,4 +468,6 @@ def round_to_quantized_type_args(
     else:
         raise ValueError(f"Invalid quantization type {args.type}")
 
-    return rounded.to(original_dtype)
+    if cast_to_original_dtype:
+        return rounded.to(original_dtype)
+    return rounded
