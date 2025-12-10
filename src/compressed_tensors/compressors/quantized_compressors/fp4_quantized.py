@@ -81,6 +81,14 @@ class NVFP4PackedCompressor(BaseQuantizationCompressor):
         }
         return output
 
+    def compress_scale(
+        self,
+        scale: Tensor,
+        quantization_args: QuantizationArgs,
+    ) -> Dict[str, torch.Tensor]:
+        assert quantization_args.scale_dtype is not None
+        return scale.to(quantization_args.scale_dtype)
+
     def compress_weight(
         self,
         weight: Tensor,
@@ -103,7 +111,9 @@ class NVFP4PackedCompressor(BaseQuantizationCompressor):
         if device is not None:
             weight_packed = weight_packed.to(device)
         compressed_dict["weight_packed"] = weight_packed
-        compressed_dict["weight_scale"] = scale.to(quantization_args.scale_dtype)
+        compressed_dict["weight_scale"] = self.compress_scale(
+            scale=scale, quantization_args=quantization_args
+        )
         return compressed_dict
 
     def decompress_weight(
@@ -130,7 +140,21 @@ class MXFP4PackedCompressor(NVFP4PackedCompressor):
     Alias for mxfp4 quantized models
     """
 
-    pass
+    def compress_scale(
+        self,
+        scale: Tensor,
+        quantization_args: QuantizationArgs,
+    ) -> Dict[str, torch.Tensor]:
+        assert quantization_args.scale_dtype is not None
+        scale_exp = 127 + torch.floor(torch.log2(scale)).to(torch.int32) - 2
+        return scale_exp.to(quantization_args.scale_dtype)
+
+    def decompress_weight(
+        self,
+        compressed_data: Dict[str, Tensor],
+        quantization_args: Optional[QuantizationArgs] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("MXFP4 Decompression is currently not supported")
 
 
 @torch.compile(fullgraph=True, dynamic=True)

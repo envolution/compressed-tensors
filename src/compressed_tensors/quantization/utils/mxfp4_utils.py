@@ -13,16 +13,29 @@
 # limitations under the License.
 
 import torch
-from compressed_tensors.quantization.quant_args import BFLOAT16_DATA, FP4_E2M1_DATA
+from compressed_tensors.quantization.quant_args import (
+    BFLOAT16_DATA,
+    FP4_E2M1_DATA,
+    QuantizationArgs,
+)
 
 
-__all__ = ["convert_mxfp4_exp_scale", "generate_mxfp4_scales", "round_to_power_2"]
+__all__ = [
+    "maybe_convert_from_mxfp4_exp",
+    "generate_mxfp4_scales",
+    "round_to_power_2",
+    "should_generatre_mxfp4_scales",
+]
 
 # Reference: https://github.com/vllm-project/vllm/blob/main/tests/quantization/reference_mxfp4.py # noqa: E501
 
 
-def convert_mxfp4_exp_scale(
-    scale: torch.Tensor, dtype: torch.dtype = torch.bfloat16
+def should_generatre_mxfp4_scales(args: QuantizationArgs):
+    return args.num_bits == 4 and args.type == "float" and args.group_size == 32
+
+
+def maybe_convert_from_mxfp4_exp(
+    args: QuantizationArgs, scale: torch.Tensor
 ) -> torch.Tensor:
     """
     Converts mxfp4 scales. Scales are powers of 2, with the
@@ -32,10 +45,12 @@ def convert_mxfp4_exp_scale(
     :param scale: uint8 exponent scale
     :param dtype: dense dtype
     """
-    assert scale.dtype == torch.uint8
-    scale_exp = scale.to(torch.int32) - 127
-    scale = 2.00 ** (scale_exp.to(torch.float))
-    return scale.to(dtype)
+    original_dtype = scale.dtype
+    if should_generatre_mxfp4_scales(args):
+        scale_exp = scale.to(torch.int32) - 127
+        scale = 2.00 ** (scale_exp.to(torch.float))
+        return scale.to(original_dtype)
+    return scale
 
 
 def round_to_power_2(x: torch.Tensor) -> torch.Tensor:
@@ -77,21 +92,12 @@ def generate_mxfp4_scales(x: torch.Tensor) -> torch.Tensor:
     Generate mxfp4 scales. The scales require the following steps
     1. Round to the closest power of 2
     2. Convert to exponent
-    3. Store in uint8
 
     Called when calculating qparams using observers.
 
     :param x: tensor to round to closest power of 2
-    :returns uint8 scales as exponents
+    :returns scales as exponents
     """
     # Round to closest power of 2
     scale_power_2 = round_to_power_2(x)
-    # Convert to exponent
-    scale_exp = 127 + torch.floor(torch.log2(scale_power_2)).to(torch.int32) - 2
-    # Clamp and store in uint8, as expected by mxfp4
-    scale_exp = torch.clamp(
-        scale_exp,
-        max=torch.iinfo(torch.uint8).max,
-        min=torch.iinfo(torch.uint8).min,
-    )
-    return scale_exp.to(torch.uint8)
+    return 127 + torch.floor(torch.log2(scale_power_2)) - 2
