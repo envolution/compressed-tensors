@@ -24,7 +24,6 @@ from compressed_tensors.utils import (
     get_nested_weight_mappings,
     merge_names,
 )
-from compressed_tensors.utils.safetensors_load import match_param_name
 from safetensors import safe_open
 from torch import Tensor
 from tqdm import tqdm
@@ -72,6 +71,7 @@ class BaseQuantizationCompressor(BaseCompressor):
         model_state: Dict[str, Tensor],
         names_to_scheme: Dict[str, QuantizationScheme],
         show_progress: bool = False,
+        compression_device: str = "cpu",
         **kwargs,
     ) -> Dict[str, Tensor]:
         """
@@ -85,13 +85,11 @@ class BaseQuantizationCompressor(BaseCompressor):
         """
         uncompressed_names = list(model_state.keys())
         compressed_dict = {}
-        save_device = "cpu"
 
         # compress values
         desc = "Compressing with quantization"
         for name in tqdm(uncompressed_names, desc=desc, disable=(not show_progress)):
             value = model_state[name]
-
             # compress weights
             if name.endswith("weight"):
                 prefix = name.removesuffix("weight")
@@ -104,10 +102,11 @@ class BaseQuantizationCompressor(BaseCompressor):
 
                 # is scale does not exist, then weight cannot be compressed
                 if scale is None:
-                    compressed_dict[name] = value.to(save_device)
+                    compressed_dict[name] = value.to(compression_device)
                     continue
 
-                # compress values on cpu (memory movement too expensive)
+                # compress values on meta if loading from meta otherwise on cpu (memory
+                # movement too expensive)
                 module_path = prefix[:-1] if prefix.endswith(".") else prefix
                 quant_args = names_to_scheme[module_path].weights
                 compressed_values = self.compress_weight(
@@ -117,26 +116,29 @@ class BaseQuantizationCompressor(BaseCompressor):
                     global_scale=global_scale,
                     g_idx=g_idx,
                     quantization_args=quant_args,
-                    device="cpu",
+                    device=compression_device,
                 )
 
                 # update state dict
                 for key, value in compressed_values.items():
-                    compressed_dict[prefix + key] = value.to(save_device)
+                    compressed_dict[prefix + key] = value.to(compression_device)
 
             else:
                 # omit saving zero points for symmetric or packed quantization
                 if name.endswith("zero_point") and self._skip_zp(name, names_to_scheme):
                     continue
 
-                # omit saving for g_idx if uninitialized
-                # TODO: does this case actually occur?
-                elif name.endswith("g_idx") and torch.any(value <= -1):
+                if name.endswith("weight_scale") and self._skip_scale():
                     continue
 
-                compressed_dict[name] = value.to(save_device)
+                compressed_dict[name] = value.to(compression_device)
 
         return compressed_dict
+
+    def _skip_scale(self):
+        from compressed_tensors.compressors import NVFP4PackedCompressor
+
+        return isinstance(self, NVFP4PackedCompressor)
 
     def _skip_zp(
         self, name: str, names_to_scheme: Dict[str, QuantizationScheme]

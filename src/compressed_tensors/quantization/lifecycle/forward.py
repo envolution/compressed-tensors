@@ -21,7 +21,7 @@ from compressed_tensors.quantization.quant_args import (
     DynamicType,
     QuantizationArgs,
     QuantizationStrategy,
-    round_to_quantized_type,
+    round_to_quantized_type_args,
 )
 from compressed_tensors.quantization.quant_config import QuantizationStatus
 from compressed_tensors.quantization.quant_scheme import QuantizationScheme
@@ -29,7 +29,6 @@ from compressed_tensors.quantization.utils import (
     calculate_range,
     compute_dynamic_scales_and_zp,
 )
-from compressed_tensors.utils import safe_permute
 from torch.nn import Module
 
 
@@ -111,10 +110,26 @@ def dequantize(
         elif scale.ndim == 2:
             if scale.shape[1] == 1:
                 args = QuantizationArgs(strategy=QuantizationStrategy.CHANNEL)
-            else:
+            # Scale height matches input or is 1 -> group quantization across columns
+            #
+            # Example 1: scale.shape[0] == 1
+            # x_q: (4, 8), scale: (1, 4) -> 2 columns per group
+            #
+            # Example 2: scale.shape[0] == x_q.shape[0]
+            # x_q: (4, 8), scale: (4, 4) -> 2 elements per group (per row)
+            elif (scale.shape[0] == 1) or (scale.shape[0] == x_q.shape[0]):
                 group_size = int(x_q.shape[1] / scale.shape[1])
                 args = QuantizationArgs(
                     strategy=QuantizationStrategy.GROUP, group_size=group_size
+                )
+            else:
+                rows, cols = x_q.shape[-2], x_q.shape[-1]
+                block_height = rows // scale.shape[0]  # Rows per block
+                block_width = cols // scale.shape[1]  # Columns per block
+
+                args = QuantizationArgs(
+                    strategy=QuantizationStrategy.BLOCK,
+                    block_structure=[block_height, block_width],
                 )
         else:
             raise ValueError(
@@ -189,14 +204,68 @@ def _process_quantization(
     q_min, q_max = calculate_range(args, x.device)
     group_size = args.group_size
 
-    if args.strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
-        n_dims = x.shape
-        if len(n_dims) > 2:
-            x = x.squeeze(0)
+    # blockwise FP8: quantize per 2D block, supports block_structure for static block
+    # quantization
+    if args.strategy == QuantizationStrategy.BLOCK:
+        original_shape = x.shape
+        rows, cols = x.shape[-2], x.shape[-1]
+        block_height, block_width = args.block_structure
+
+        # Ensure exact division (tensor dimensions must be divisible by block size)
+        if rows % block_height != 0:
+            raise ValueError(
+                f"Tensor height {rows} is not divisible by block_height {block_height}."
+                f" Block quantization requires exact division."
+            )
+        if cols % block_width != 0:
+            raise ValueError(
+                f"Tensor width {cols} is not divisible by block_width {block_width}. "
+                f"Block quantization requires exact division."
+            )
+
+        # reshape into blocks and transpose to make each block contiguous
+        num_rows_blocks = rows // block_height
+        num_cols_blocks = cols // block_width
+        x_blocks = x.reshape(
+            num_rows_blocks,
+            block_height,
+            num_cols_blocks,
+            block_width,
+        ).transpose(1, 2)
+
+        # expand scale/zero_point for blocks
+        sb = scale.unsqueeze(-1).unsqueeze(-1)
+        zb = zero_point.unsqueeze(-1).unsqueeze(-1) if zero_point is not None else None
+        if do_quantize:
+            # quantize blocks
+            x_blocks = _quantize(
+                x=x_blocks,
+                scale=sb,
+                zero_point=zb,
+                q_min=q_min,
+                q_max=q_max,
+                args=args,
+                dtype=dtype,
+                global_scale=global_scale,
+            )
+        if do_dequantize:
+            # dequantize blocks
+            x_blocks = _dequantize(
+                x_q=x_blocks,
+                scale=sb,
+                zero_point=zb,
+                global_scale=global_scale,
+            )
+        # restore original shape
+        output = x_blocks.transpose(1, 2).reshape(original_shape)
+    elif args.strategy in (
+        QuantizationStrategy.GROUP,
+        QuantizationStrategy.TENSOR_GROUP,
+    ):
 
         output_dtype = dtype if dtype is not None else x.dtype
         output = torch.zeros_like(x).to(output_dtype)
-        columns = output.shape[1]
+        columns = output.shape[-1]
 
         # TODO: make validation step for inputs
 
@@ -209,7 +278,7 @@ def _process_quantization(
             if columns % group_size != 0:
                 raise ValueError(
                     "tensor column shape must be divisble "
-                    f"by the given group_size {group_size}"
+                    f"by the given group_size {group_size} but got {columns}"
                 )
 
         # support column-order (default) quantization as well as other orderings
@@ -224,16 +293,14 @@ def _process_quantization(
             group_sizes = group_sizes[torch.argsort(group_indices)]
 
             perm = torch.argsort(g_idx)
-            x = safe_permute(x, perm, dim=1)
+            x = x.index_select(-1, perm)
 
-        x = torch.reshape(
-            x,
-            (
-                x.shape[0],
-                ceil(x.shape[1] / group_size),
-                group_size,
-            ),
+        # Maintain all dimensions except the last dim, which is divided by group_size
+        reshaped_dims = (
+            ceil(x.shape[-1] / group_size),
+            group_size,
         )
+        x = x.unflatten(-1, reshaped_dims)
 
         if do_quantize:
             output = _quantize(
@@ -256,20 +323,14 @@ def _process_quantization(
                 global_scale=global_scale,
             )
 
-        output = torch.reshape(
-            output,
-            (output.shape[0], output.shape[1] * output.shape[2]),
-        )
-
+        output = output.flatten(start_dim=-2)
         output = output.to(output_dtype)
 
         if not is_column_order:
-            output = safe_permute(output, torch.argsort(perm), dim=1)
+            inv_perm = torch.argsort(perm)
+            output = output.index_select(-1, inv_perm)
 
-        if len(n_dims) > 2:
-            output = output.unsqueeze(0)
-
-    else:  # covers channel, token and tensor strategies
+    else:  # covers tensor, channel, token, and attn_head strategies
         if do_quantize:
             output = _quantize(
                 x=x,
@@ -405,20 +466,17 @@ def _quantize(
     # if a global scale is optionally provided, use it
     # to further scale the local `scale` parameter
     if global_scale is not None:
-        scale = scale.to(global_scale.dtype) / global_scale
+        scale = scale / global_scale
 
     scaled = x / scale
 
     if zero_point is not None:
         scaled += zero_point.to(x.dtype)
 
-    # clamp first because cast isn't guaranteed to be saturated (ie for fp8)
-    clamped_value = torch.clamp(
-        scaled,
-        q_min,
-        q_max,
+    # clamp and round
+    quantized_value = round_to_quantized_type_args(
+        tensor=scaled, args=args, min=q_min, max=q_max
     )
-    quantized_value = round_to_quantized_type(clamped_value, args)
 
     if dtype is not None:
         quantized_value = quantized_value.to(dtype)
@@ -438,7 +496,7 @@ def _dequantize(
     # if a global scale is optionally provided, use it
     # to further scale the local `scale` parameter
     if global_scale is not None:
-        scale = scale.to(global_scale.dtype) / global_scale
+        scale = scale / global_scale
 
     dequant_value = x_q.to(scale.dtype)
 

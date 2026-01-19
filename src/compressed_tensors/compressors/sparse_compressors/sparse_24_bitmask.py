@@ -13,13 +13,13 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Dict, Generator, List, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import torch
 from compressed_tensors.compressors.base import BaseCompressor
 from compressed_tensors.compressors.sparse_compressors.base import BaseSparseCompressor
 from compressed_tensors.config import CompressionFormat, SparsityStructure
-from compressed_tensors.quantization import FP8_DTYPE
+from compressed_tensors.quantization import FP8_E4M3_DATA
 from compressed_tensors.utils import merge_names, pack_bitmasks, unpack_bitmasks
 from torch import Tensor
 
@@ -56,8 +56,10 @@ class Sparse24BitMaskCompressor(BaseSparseCompressor):
         bitmask_tensor = Sparse24BitMaskTensor.from_dense(
             value, self.config.sparsity_structure
         )
-        bitmask_dict = bitmask_tensor.dict(name_prefix=name, device="cpu")
-        return bitmask_dict
+        return bitmask_tensor.dict(
+            name_prefix=name,
+            device="meta" if value.is_meta else "cpu",
+        )
 
     def decompress_weight(self, weight_data):
         data = Sparse24BitMaskTensor.from_compressed_data(**weight_data)
@@ -90,9 +92,14 @@ class Sparse24BitMaskTensor:
         :return: instantiated compressed tensor
         """
         shape = list(tensor.shape)
-        compressed, bitmask = sparse24_bitmask_compress(
-            tensor.cpu(), sparsity_structure=sparsity_structure
-        )
+        if tensor.is_meta:
+            compressed, bitmask = sparse24_bitmask_compress(
+                tensor, sparsity_structure=sparsity_structure
+            )
+        else:
+            compressed, bitmask = sparse24_bitmask_compress(
+                tensor.cpu(), sparsity_structure=sparsity_structure
+            )
         return Sparse24BitMaskTensor(
             shape=shape,
             compressed=compressed,
@@ -169,13 +176,24 @@ def sparse24_bitmask_compress(
         SparsityStructure(sparsity_structure) == SparsityStructure.TWO_FOUR
     ), "Only 2:4 sparsity is supported"
 
+    if tensor.is_meta:
+        num_rows, num_cols = tensor.shape
+        compressed_values = torch.empty(
+            (num_rows, num_cols // 2), dtype=tensor.dtype, device="meta"
+        )
+        packed_cols = (num_cols + 7) // 8
+        bitmasks_packed = torch.empty(
+            (num_rows, packed_cols), dtype=torch.uint8, device="meta"
+        )
+        return compressed_values, bitmasks_packed
+
     bytemasks = get_24_bytemasks(tensor=tensor)
 
-    if tensor.dtype == FP8_DTYPE:
+    if tensor.dtype == FP8_E4M3_DATA.dtype:
         # acces raw bytes of the tensor
         tensor_view = tensor.view(torch.int8)
         values = tensor_view[bytemasks]
-        values = values.view(FP8_DTYPE)
+        values = values.view(FP8_E4M3_DATA.dtype)
     else:
         values = tensor[bytemasks]
 
@@ -223,7 +241,7 @@ def get_24_bytemasks(tensor):
                         multiple of 4.
     """
     original_dtype = tensor.dtype
-    if tensor.dtype == FP8_DTYPE:
+    if tensor.dtype == FP8_E4M3_DATA.dtype:
         tensor = tensor.view(torch.int8)
     original_shape = tensor.shape
     num_elements = tensor.numel()

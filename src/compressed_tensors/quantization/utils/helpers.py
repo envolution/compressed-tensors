@@ -14,7 +14,7 @@
 
 import logging
 import math
-from typing import Generator, List, Optional, Tuple
+from typing import Generator, Optional, Tuple
 
 import torch
 from compressed_tensors.quantization.quant_args import (
@@ -24,22 +24,26 @@ from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
+    round_to_quantized_type_dtype,
 )
 from compressed_tensors.quantization.quant_scheme import QuantizationScheme
+from compressed_tensors.quantization.utils.mxfp4_utils import (
+    generate_mxfp4_scales,
+    maybe_convert_from_mxfp4_exp,
+    should_generatre_mxfp4_scales,
+)
+from compressed_tensors.utils import deprecated
+from loguru import logger
 from torch import FloatTensor, IntTensor, Tensor
 from torch.nn import Module
-from tqdm import tqdm
 
 
 __all__ = [
-    "infer_quantization_status",
     "is_module_quantized",
     "is_model_quantized",
     "module_type",
-    "calculate_compression_ratio",
     "get_torch_bit_depth",
     "can_quantize",
-    "parse_out_kv_cache_args",
     "KV_CACHE_TARGETS",
     "is_kv_cache_quant_scheme",
     "iter_named_leaf_modules",
@@ -48,7 +52,7 @@ __all__ = [
     "calculate_range",
     "calculate_qparams",
     "generate_gparam",
-    "is_fp4",
+    "strategy_cdiv",
 ]
 
 # target the self_attn layer
@@ -56,13 +60,6 @@ __all__ = [
 KV_CACHE_TARGETS = ["re:.*self_attn$"]
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-
-
-def is_fp4(quantization_args: QuantizationArgs):
-    return (
-        quantization_args.num_bits == 4
-        and quantization_args.type == QuantizationType.FLOAT
-    )
 
 
 def calculate_qparams(
@@ -93,52 +90,56 @@ def calculate_qparams(
     bit_min, bit_max = calculate_range(quantization_args, device)
     bit_range = bit_max - bit_min
 
-    if is_fp4(quantization_args=quantization_args):
-        zp_dtype = FP8_E4M3_DATA.dtype
-    else:
-        zp_dtype = quantization_args.pytorch_dtype()
-
+    # 1. Generate scale and zero-point
     if quantization_args.symmetric:
         max_val_pos = torch.max(torch.abs(min_vals), torch.abs(max_vals))
-
-        if is_fp4(quantization_args=quantization_args) and global_scale is not None:
-            # Conditionally scale the generated local scale by a global_scale
-            scales = global_scale * (max_val_pos / FP4_E2M1_DATA.max)
-            scales = torch.clamp(scales, max=FP8_E4M3_DATA.max, min=FP8_E4M3_DATA.min)
-            scales = scales.to(FP8_E4M3_DATA.dtype)
-
+        if should_generatre_mxfp4_scales(args=quantization_args):
+            scales = generate_mxfp4_scales(x=max_val_pos)
         else:
             scales = max_val_pos / (float(bit_range) / 2)
-
-        # TODO: in the case of MoEs, the global_scale may also be 0/need to be clamped
-        if scales.dtype == FP8_E4M3_DATA.dtype:
-            # torch.clamp not supported for FP8
-            # use the next largest fp8 value from 0
-            scales = torch.where(
-                scales == 0,
-                torch.tensor(0.125, dtype=FP8_E4M3_DATA.dtype, device=device),
-                scales,
-            )
-        else:
-            scales = torch.clamp(scales, min=torch.finfo(torch.float32).eps)
-
         zero_points = torch.zeros(scales.shape, device=device, dtype=min_vals.dtype)
     else:
-        if is_fp4(quantization_args=quantization_args):
+        if (
+            quantization_args.num_bits == 4
+            and quantization_args.type == QuantizationType.FLOAT
+        ):
             raise NotImplementedError(
                 "Asymmetric Quantization is not supported for FP4"
             )
-
         scales = (max_vals - min_vals) / float(bit_range)
-        scales = torch.clamp(scales, min=torch.finfo(torch.float32).eps)
         zero_points = bit_min - (min_vals / scales)
         zero_points = torch.clamp(zero_points, bit_min, bit_max)
 
-    # match zero-points to quantized type
-    # if casting to int, use round instead of truncate
-    if quantization_args.type == QuantizationType.INT:
-        zero_points = torch.round(zero_points)
-    zero_points = zero_points.to(zp_dtype)
+    # 2. Conditionally scale the generated local scale by a global_scale
+    if global_scale is not None:
+        scales = global_scale * scales
+
+    # 3. Conditionally round the scale to the quantized dtype, if scale_dtype is set
+    if quantization_args.scale_dtype is not None:
+        scales = round_to_quantized_type_dtype(
+            scales, dtype=quantization_args.scale_dtype
+        )
+
+    # 4. Optionally remove exponent
+    scales = maybe_convert_from_mxfp4_exp(quantization_args, scales)
+
+    # 5. Update any 0s with small values to
+    # prevent div by 0
+    eps = _get_dtype_eps(
+        dtype=quantization_args.scale_dtype
+        if quantization_args.scale_dtype is not None
+        else scales.dtype
+    )
+    scales = torch.where(
+        scales == 0,
+        torch.tensor(eps, dtype=scales.dtype, device=device),
+        scales,
+    )
+
+    # 6. Round the zp to zp_dtype
+    zero_points = round_to_quantized_type_dtype(
+        zero_points, dtype=quantization_args.zp_dtype, cast_to_original_dtype=False
+    )
 
     if scales.ndim == 0:
         scales = scales.reshape(1)
@@ -167,29 +168,34 @@ def compute_dynamic_scales_and_zp(
 
     keep_dims = True
     if args.strategy == QuantizationStrategy.TOKEN:
-        dim = {1, 2}
+        dim = {0, 1}
         reduce_dims = tuple(idx for idx in range(value.ndim) if idx not in dim)
     elif args.strategy == QuantizationStrategy.TENSOR:
         reduce_dims = None
-    elif args.strategy == QuantizationStrategy.TENSOR_GROUP:
-        if len(value.shape) > 2:
-            value = value.squeeze(0)
+    elif args.strategy in (
+        QuantizationStrategy.TENSOR_GROUP,
+        QuantizationStrategy.GROUP,
+    ):
 
-        dim = {0, 1}
-        reduce_dims = tuple(idx for idx in range(3) if idx not in dim)
+        reduce_dims = -1
         keep_dims = False
-        value = torch.reshape(
-            value,
-            (
-                value.shape[0],
-                math.ceil(value.shape[1] / args.group_size),
-                args.group_size,
-            ),
+
+        reshaped_dims = (
+            math.ceil(value.shape[-1] / args.group_size),
+            args.group_size,
         )
+        value = value.unflatten(-1, reshaped_dims)
+
     else:
+        supported_strategies = (
+            QuantizationStrategy.TOKEN,
+            QuantizationStrategy.TENSOR,
+            QuantizationStrategy.TENSOR_GROUP,
+            QuantizationStrategy.GROUP,
+        )
         raise ValueError(
             "Dynamic quantization is only supported for ",
-            f"{QuantizationStrategy.TOKEN, QuantizationStrategy.TENSOR, QuantizationStrategy.TENSOR_GROUP}",
+            f"{supported_strategies}",
         )
 
     if not reduce_dims:
@@ -230,21 +236,6 @@ def calculate_range(quantization_args: QuantizationArgs, device: str) -> Tuple:
     return q_min, q_max
 
 
-def infer_quantization_status(model: Module) -> Optional["QuantizationStatus"]:  # noqa
-    """
-    Checks the quantization status of a model. Assumes all modules in the model have
-    the same status, so only the first quantized model is checked.
-
-    :param model: model to check quantization status for
-    :return: quantization status if the model is quantized, otherwise None
-    """
-    for module in model.modules():
-        status = getattr(module, "quantization_status", None)
-        if status is not None:
-            return status
-    return None
-
-
 def is_module_quantized(module: Module) -> bool:
     """
     Check if a module is quantized, based on the existence of a non-empty quantization
@@ -276,12 +267,7 @@ def is_model_quantized(model: Module) -> bool:
     :param model: pytorch model
     :return: True if model is quantized, False otherwise
     """
-
-    for _, submodule in iter_named_leaf_modules(model):
-        if is_module_quantized(submodule):
-            return True
-
-    return False
+    return any(is_module_quantized(submodule) for submodule in model.modules())
 
 
 def module_type(module: Module) -> str:
@@ -294,6 +280,11 @@ def module_type(module: Module) -> str:
     return type(module).__name__
 
 
+@deprecated(
+    message="This function will be removed in a future release. "
+    "Please use `model.named_modules()` and filter by "
+    "compressed_tensors.InternalModule if neceessary"
+)
 def iter_named_leaf_modules(model: Module) -> Generator[Tuple[str, Module], None, None]:
     """
     Yields modules that do not have any submodules except observers. The observers
@@ -320,6 +311,11 @@ def iter_named_leaf_modules(model: Module) -> Generator[Tuple[str, Module], None
                 yield name, submodule
 
 
+@deprecated(
+    message="This function will be removed in a future release. "
+    "Please use `model.named_modules()` and filter by "
+    "compressed_tensors.InternalModule if neceessary"
+)
 def iter_named_quantizable_modules(
     model: Module,
     include_children: bool = True,
@@ -330,7 +326,6 @@ def iter_named_quantizable_modules(
     Yield name and submodule of
     - leaf modules, set by include_children
     - attention modyles, set by include_attn
-
     :param model: model to get leaf modules of
     :param include_children: flag to get the leaf modules
     :param inlcude_attn: flag to get the attention modules
@@ -397,34 +392,7 @@ def can_quantize(value: torch.Tensor, quant_args: "QuantizationArgs") -> bool:  
     return bit_depth > quant_args.num_bits
 
 
-def calculate_compression_ratio(model: Module) -> float:
-    """
-    Calculates the quantization compression ratio of a pytorch model, based on the
-    number of bits needed to represent the total weights in compressed form. Does not
-    take into account activation quantizatons.
-
-    :param model: pytorch module to calculate compression ratio for
-    :return: compression ratio of the whole model
-    """
-    total_compressed = 0.0
-    total_uncompressed = 0.0
-    for name, submodule in tqdm(
-        iter_named_leaf_modules(model),
-        desc="Calculating quantization compression ratio",
-    ):
-        for parameter in model.parameters():
-            uncompressed_bits = get_torch_bit_depth(parameter)
-            compressed_bits = uncompressed_bits
-            if is_module_quantized(submodule) and submodule.quantization_scheme.weights:
-                compressed_bits = submodule.quantization_scheme.weights.num_bits
-
-            num_weights = parameter.numel()
-            total_compressed += compressed_bits * num_weights
-            total_uncompressed += uncompressed_bits * num_weights
-
-    return total_uncompressed / total_compressed
-
-
+@deprecated()
 def is_kv_cache_quant_scheme(scheme: QuantizationScheme) -> bool:
     """
     Check whether the QuantizationScheme targets the kv cache.
@@ -443,37 +411,6 @@ def is_kv_cache_quant_scheme(scheme: QuantizationScheme) -> bool:
             return True
 
     return False
-
-
-def parse_out_kv_cache_args(
-    quant_scheme_to_layers: List[QuantizationScheme],
-) -> Tuple[Optional[QuantizationArgs], List[QuantizationScheme]]:
-    """
-    If possible, parse out the kv cache specific QuantizationArgs
-    from the list of the QuantizationSchemes. If no kv cache
-    specific QuantizationArgs available, this function acts
-    as an identity function
-
-    :param quant_scheme_to_layers: list of QuantizationSchemes
-    :return: kv_cache_args (optional) and the (remaining or original)
-        list of the QuantizationSchemes
-    """
-    kv_cache_quant_scheme_to_layers = [
-        scheme for scheme in quant_scheme_to_layers if is_kv_cache_quant_scheme(scheme)
-    ]
-    quant_scheme_to_layers = [
-        scheme
-        for scheme in quant_scheme_to_layers
-        if not is_kv_cache_quant_scheme(scheme)
-    ]
-
-    if kv_cache_quant_scheme_to_layers:
-        kv_cache_quant_scheme_to_layers = kv_cache_quant_scheme_to_layers[0]
-        kv_cache_args = kv_cache_quant_scheme_to_layers.output_activations
-    else:
-        kv_cache_args = None
-
-    return kv_cache_args, quant_scheme_to_layers
 
 
 def generate_gparam(
@@ -497,3 +434,37 @@ def generate_gparam(
     max_val_pos = torch.max(torch.abs(min_vals), torch.abs(max_vals))
     global_scale = scale_data.max * quant_data.max / max_val_pos
     return global_scale.to(dtype).reshape([1])
+
+
+def strategy_cdiv(
+    value: int,
+    divisor: int,
+    strategy: Optional[QuantizationStrategy],
+    strict: bool = False,
+) -> int:
+    dividend = math.ceil(value / divisor)
+    if dividend * divisor != value:
+        message = (
+            f"{strategy} quantization strategy requires strict division of "
+            f"weight/activation size {value} and group/block size {divisor}. "
+            "consider reducing the group/block size or ignoring modules with "
+            f"weights not divisible by {divisor}"
+        )
+        if strict:
+            raise ValueError(message)
+
+        else:
+            logger.bind(log_once=True).warning(message)
+
+    return dividend
+
+
+def _get_dtype_eps(dtype: torch.dtype) -> float:
+    if dtype == FP8_E4M3_DATA.dtype:
+        return 0.125
+    elif dtype == FP4_E2M1_DATA.dtype:
+        return 0.25
+    elif torch.is_floating_point(torch.tensor([], dtype=dtype)):
+        return torch.finfo(dtype).eps
+    else:
+        return 1

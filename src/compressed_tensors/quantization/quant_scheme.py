@@ -11,17 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import warnings
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
+import torch
+from compressed_tensors.config import CompressionFormat
 from compressed_tensors.quantization.quant_args import (
+    FP8_E4M3_DATA,
     DynamicType,
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,
 )
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 __all__ = [
@@ -41,19 +44,44 @@ class QuantizationScheme(BaseModel):
     :param weights: quantization config for layer weights
     :param input_activations: quantization config for layer inputs
     :param output_activations: quantization config for layer outputs
+    :param format: CompressionFormat for the layer
     """
 
     targets: List[str]
     weights: Optional[QuantizationArgs] = None
     input_activations: Optional[QuantizationArgs] = None
     output_activations: Optional[QuantizationArgs] = None
+    format: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_model_after(model: "QuantizationScheme") -> "QuantizationScheme":
         inputs = model.input_activations
         outputs = model.output_activations
+        weights = model.weights
+        format = model.format
 
         if inputs is not None:
+            if inputs.strategy not in (
+                QuantizationStrategy.TOKEN,
+                QuantizationStrategy.TENSOR,
+                QuantizationStrategy.GROUP,
+                QuantizationStrategy.TENSOR_GROUP,
+                QuantizationStrategy.ATTN_HEAD,
+            ):
+                if (
+                    inputs.strategy == QuantizationStrategy.GROUP
+                    and inputs.dynamic is True
+                ):
+                    raise NotImplementedError(
+                        "Static and local group-wise activation "
+                        "quantization is not supported"
+                    )
+
+                raise NotImplementedError(
+                    f"Using {inputs.strategy} strategy is not supported for "
+                    "activation quantization"
+                )
+
             if inputs.actorder is not None:
                 raise ValueError("Cannot apply actorder to input activations")
 
@@ -61,7 +89,31 @@ class QuantizationScheme(BaseModel):
             if outputs.actorder is not None:
                 raise ValueError("Cannot apply actorder to output activations")
 
+        if format == CompressionFormat.mixed_precision.value:
+            raise ValueError(
+                "mixed-precision cannot be set as a format for a QuantizationScheme"
+            )
+
+        if (
+            inputs
+            and weights
+            and weights.strategy == QuantizationStrategy.GROUP
+            and inputs.strategy == QuantizationStrategy.GROUP
+            and weights.group_size != inputs.group_size
+        ):
+            warnings.warn(
+                "Using GROUP strategy for both weights and input_activations "
+                f"with different group sizes ({weights.group_size} vs "
+                f"{inputs.group_size}) may complicate fused kernel implementations. "
+                "Consider using TENSOR_GROUP strategy for both or matching group"
+                " sizes.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         return model
+
+    model_config = ConfigDict(extra="forbid")
 
 
 """
@@ -109,6 +161,8 @@ NVFP4A16 = dict(
         symmetric=True,
         dynamic=False,
         group_size=16,
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
     )
 )
 
@@ -121,6 +175,9 @@ NVFP4 = dict(
         symmetric=True,
         dynamic=False,
         group_size=16,
+        observer="static_minmax",
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
     ),
     input_activations=QuantizationArgs(
         num_bits=4,
@@ -129,8 +186,48 @@ NVFP4 = dict(
         symmetric=True,
         dynamic=DynamicType.LOCAL,
         group_size=16,
+        observer="static_minmax",
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
     ),
 )
+
+MXFP4A16 = dict(
+    weights=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    )
+)
+
+MXFP4 = dict(
+    weights=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    ),
+    input_activations=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        dynamic=True,
+        symmetric=True,
+        group_size=32,
+        scale_dtype=torch.uint8,
+        zp_dtype=torch.uint8,
+    ),
+)
+
 
 # 8 bit integer weights and 8 bit activations quantization
 INT8_W8A8 = dict(
@@ -206,6 +303,26 @@ INT8_W4A8 = dict(
     ),
 )
 
+# 4 bit integer weights and 8 bit FP activations quantization
+W4AFP8 = dict(
+    weights=QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.GROUP,
+        group_size=128,
+        symmetric=True,
+        dynamic=False,
+    ),
+    input_activations=QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.TOKEN,
+        symmetric=True,
+        dynamic=True,
+        observer=None,
+    ),
+)
+
 # FP8 weights and FP8 activations quantization
 FP8 = dict(
     weights=QuantizationArgs(
@@ -243,6 +360,29 @@ FP8_DYNAMIC = dict(
     ),
 )
 
+# Block‐wise FP8 (deepseekv3-style quantization):
+# static 128x128 per‐block weights and
+# dynamic per‐token‐group activations
+FP8_BLOCK = dict(
+    weights=QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.BLOCK,
+        symmetric=True,
+        dynamic=False,
+        block_structure=[128, 128],
+    ),
+    input_activations=QuantizationArgs(
+        num_bits=8,
+        type=QuantizationType.FLOAT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=True,
+        observer=None,
+        group_size=128,
+    ),
+)
+
 PRESET_SCHEMES = {
     # Unquantized (no-op)
     "UNQUANTIZED": UNQUANTIZED,
@@ -254,9 +394,13 @@ PRESET_SCHEMES = {
     "W8A8": INT8_W8A8,
     "INT8": INT8_W8A8,  # alias for W8A8
     "W4A8": INT8_W4A8,
+    "W4AFP8": W4AFP8,
     # Float weight and activation schemes
     "FP8": FP8,
     "FP8_DYNAMIC": FP8_DYNAMIC,
+    "FP8_BLOCK": FP8_BLOCK,
     "NVFP4A16": NVFP4A16,
     "NVFP4": NVFP4,
+    "MXFP4A16": MXFP4A16,
+    "MXFP4": MXFP4,
 }

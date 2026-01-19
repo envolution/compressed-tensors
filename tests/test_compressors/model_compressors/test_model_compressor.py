@@ -20,8 +20,13 @@ import pytest
 import torch
 import torch.nn as nn
 from compressed_tensors.compressors import ModelCompressor
-from compressed_tensors.config import SparsityCompressionConfig
-from compressed_tensors.quantization import QuantizationConfig
+from compressed_tensors.config import CompressionFormat, SparsityCompressionConfig
+from compressed_tensors.quantization import (
+    FP8_E4M3_DATA,
+    QuantizationArgs,
+    QuantizationConfig,
+    QuantizationScheme,
+)
 from safetensors.torch import save_file
 from tests.testing_utils import induce_sparsity, requires_hf_quantizer
 from transformers import AutoModelForCausalLM
@@ -114,16 +119,14 @@ class DummyLinearModel(nn.Module):
         self.linear = nn.Linear(in_features, out_features, bias=False)
 
         # Set the weights of the linear layer
-        self.linear.weight = nn.Parameter(weights, requires_grad=False)
+        self.linear.weight = nn.Parameter(weights.detach().clone())
 
         # Attach weight_scale and weight_zero_point as parameters
         if weight_scale is not None:
-            self.linear.weight_scale = nn.Parameter(
-                torch.tensor(weight_scale), requires_grad=False
-            )
+            self.linear.weight_scale = nn.Parameter(weight_scale.detach().clone())
         if weight_zero_point is not None:
             self.linear.weight_zero_point = nn.Parameter(
-                torch.tensor(weight_zero_point), requires_grad=False
+                weight_zero_point.detach().clone()
             )
 
     def forward(self, x):
@@ -249,61 +252,6 @@ class TwoLayerModel(nn.Module):
         return x
 
 
-@pytest.mark.parametrize(
-    "model, sparsity_config, quantization_config, expected",
-    [
-        (
-            TwoLayerModel(),
-            get_bitmask_sparsity_config(targets=["re:.*layer1$"]),
-            create_quantization_config(bits=8, type="int", strategy="channel"),
-            {"layer1.weight"},
-        )
-    ],
-)
-def test_get_missing_keys(model, sparsity_config, quantization_config, expected):
-    model_compressor = ModelCompressor(
-        sparsity_config=sparsity_config, quantization_config=quantization_config
-    )
-
-    actual = model_compressor.get_missing_module_keys(model)
-    assert len(actual) == len(expected) and all(key in actual for key in expected)
-
-
-@pytest.mark.parametrize(
-    "model, sparsity_config, quantization_config, expected",
-    [
-        (
-            TwoLayerModel(),
-            get_bitmask_sparsity_config(targets=["re:.*layer1$"]),
-            create_quantization_config(bits=8, type="int", strategy="channel"),
-            {
-                f"{layer}.{suffix}"
-                for layer, suffixes in {
-                    "layer1": [
-                        "shape",
-                        "row_offsets",
-                        "weight_zero_point",
-                        "weight_g_idx",
-                        "bitmask",
-                        "weight_scale",
-                        "compressed",
-                    ],
-                    "layer2": ["weight_scale", "weight_zero_point", "weight_g_idx"],
-                }.items()
-                for suffix in suffixes
-            },
-        )
-    ],
-)
-def test_get_unexpected_keys(model, sparsity_config, quantization_config, expected):
-    model_compressor = ModelCompressor(
-        sparsity_config=sparsity_config, quantization_config=quantization_config
-    )
-
-    actual = model_compressor.get_unexpected_file_keys(model)
-    assert len(actual) == len(expected) and all(key in actual for key in expected)
-
-
 def _create_dummy_checkpoint(state_dict, save_dir, model_compressor):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -413,6 +361,162 @@ def test_compress_model(model_stub, q_format, s_config, tmpdir):
 
 
 @pytest.mark.parametrize(
+    "model_stub,q_format,s_config",
+    [
+        (
+            "nm-testing/llama2.c-stories42M-gsm8k-quantized-only-uncompressed",
+            "float-quantized",
+            None,
+        ),
+        (
+            "nm-testing/llama2.c-stories42M-gsm8k-sparse-only-uncompressed",
+            None,
+            "sparse-24-bitmask",
+        ),
+        (
+            "nm-testing/llama2.c-stories42M-gsm8k-stacked-uncompressed",
+            "float-quantized",
+            "sparse-24-bitmask",
+        ),
+        (
+            "nm-testing/llama2.c-stories15M-ultrachat-mixed-uncompressed",
+            "pack-quantized",
+            None,
+        ),
+    ],
+)
+def test_compress_model_meta(model_stub, q_format, s_config):
+    # Load model on CPU to get expected compressed state_dict
+    cpu_model = AutoModelForCausalLM.from_pretrained(model_stub)
+    reference_compressor = ModelCompressor.from_pretrained_model(
+        cpu_model, s_config, q_format
+    )
+    # Only stores dtype because meta model does not store values
+    expected = {k: v.dtype for k, v in reference_compressor.compress(cpu_model).items()}
+
+    # Load model on meta device
+    meta_model = AutoModelForCausalLM.from_pretrained(
+        model_stub,
+        low_cpu_mem_usage=True,
+    )
+    for module in meta_model.modules():
+        if hasattr(module, "to_empty"):
+            module.to_empty(device="meta")
+
+    # Compress in-place on meta model
+    compressor = ModelCompressor.from_pretrained_model(meta_model, s_config, q_format)
+    compressor.compress_model(meta_model)
+
+    # Compare keys and dtypes
+    compressed = dict(meta_model.state_dict())
+    assert set(compressed.keys()) == set(expected.keys())
+    for key, dtype in expected.items():
+        assert compressed[key].dtype == dtype, f"{key} has incorrect dtype"
+
+
+def test_multiple_quant_compressors():
+    model = torch.nn.Sequential(torch.nn.Linear(1, 2), torch.nn.Linear(2, 3))
+    input_activations = QuantizationArgs(num_bits=8, type="float")
+    weights = QuantizationArgs(num_bits=8, type="float")
+
+    scheme_fp8 = QuantizationScheme(
+        targets=["Linear"],
+        weights=weights,
+        input_activations=input_activations,
+        format=CompressionFormat.float_quantized.value,
+    )
+
+    input_activations = QuantizationArgs(
+        num_bits=4,
+        type="float",
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
+    )
+    weights = QuantizationArgs(
+        num_bits=4,
+        type="float",
+        scale_dtype=FP8_E4M3_DATA.dtype,
+        zp_dtype=FP8_E4M3_DATA.dtype,
+    )
+
+    scheme_nvfp4 = QuantizationScheme(
+        targets=["Linear"],
+        weights=weights,
+        input_activations=input_activations,
+        format=CompressionFormat.nvfp4_pack_quantized.value,
+    )
+
+    model[0].quantization_scheme = scheme_fp8
+    model[0].quantization_status = "frozen"
+    model[1].quantization_scheme = scheme_nvfp4
+    model[1].quantization_status = "frozen"
+
+    formats = [scheme_fp8.format, scheme_nvfp4.format]
+
+    compressor = ModelCompressor.from_pretrained_model(model, None)
+    assert isinstance(compressor.quantization_compressor, dict)
+    assert (
+        compressor.quantization_config.format == CompressionFormat.mixed_precision.value
+    )
+    assert all(format in compressor.quantization_compressor for format in formats)
+
+
+@pytest.mark.parametrize(
+    "model, sparsity_config, quantization_config, expected",
+    [
+        (
+            TwoLayerModel(),
+            get_bitmask_sparsity_config(targets=["re:.*layer1$"]),
+            create_quantization_config(bits=8, type="int", strategy="channel"),
+            {"layer1.weight"},
+        )
+    ],
+)
+def test_get_missing_keys(model, sparsity_config, quantization_config, expected):
+    model_compressor = ModelCompressor(
+        sparsity_config=sparsity_config, quantization_config=quantization_config
+    )
+
+    actual = model_compressor.get_missing_module_keys(model)
+    assert len(actual) == len(expected) and all(key in actual for key in expected)
+
+
+@pytest.mark.parametrize(
+    "model, sparsity_config, quantization_config, expected",
+    [
+        (
+            TwoLayerModel(),
+            get_bitmask_sparsity_config(targets=["re:.*layer1$"]),
+            create_quantization_config(bits=8, type="int", strategy="channel"),
+            {
+                f"{layer}.{suffix}"
+                for layer, suffixes in {
+                    "layer1": [
+                        "shape",
+                        "row_offsets",
+                        "weight_zero_point",
+                        "weight_g_idx",
+                        "bitmask",
+                        "weight_scale",
+                        "compressed",
+                    ],
+                    "layer2": ["weight_scale", "weight_zero_point", "weight_g_idx"],
+                }.items()
+                for suffix in suffixes
+            },
+        )
+    ],
+)
+def test_get_unexpected_keys(model, sparsity_config, quantization_config, expected):
+    model_compressor = ModelCompressor(
+        sparsity_config=sparsity_config, quantization_config=quantization_config
+    )
+
+    actual = model_compressor.get_unexpected_file_keys(model)
+    assert len(actual) == len(expected) and all(key in actual for key in expected)
+
+
+@pytest.mark.parametrize(
     "model_stub,comp_stub",
     [
         (
@@ -468,8 +572,12 @@ def test_decompress_model(model_stub, comp_stub):
     # equivalent to decompressing from disk
     assert decompressed.keys() == true_decompressed.keys()
     for key in decompressed.keys():
-        assert decompressed[key].dtype == true_decompressed[key].dtype
-        assert torch.all(decompressed[key] == true_decompressed[key]), f"{key}"
+        assert (
+            decompressed[key].dtype == true_decompressed[key].dtype
+        ), f"{key} dtypes not equal"
+        assert torch.all(
+            decompressed[key] == true_decompressed[key]
+        ), f"{key} values not equal"
 
 
 def remove_empty_weight_zero_points(state_dict):

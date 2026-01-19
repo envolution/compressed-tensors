@@ -88,7 +88,7 @@ def _setup_packages() -> List:
     )
 
 def _setup_install_requires() -> List:
-    return ["torch>=1.7.0", "transformers", "pydantic>=2.0"]
+    return ["torch>=1.7.0", "transformers", "pydantic>=2.0", "loguru"]
 
 def _setup_extras() -> Dict:
     return {
@@ -109,9 +109,10 @@ setup(
     description="Library for utilization of compressed safetensors of neural network models",
     long_description=_setup_long_description()[0],
     long_description_content_type=_setup_long_description()[1],
-    url="https://github.com/neuralmagic/compressed-tensors",
+    url="https://github.com/vllm-project/compressed-tensors",
     extras_require=_setup_extras(),
     install_requires=_setup_install_requires(),
     package_dir={"": "src"},
+    package_data={"": ["transform/utils/hadamards.safetensors"]},
     packages=_setup_packages(),
 )

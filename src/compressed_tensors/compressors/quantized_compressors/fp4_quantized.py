@@ -15,7 +15,6 @@
 
 from typing import Dict, Optional, Tuple
 
-import numpy
 import torch
 from compressed_tensors.compressors.base import BaseCompressor
 from compressed_tensors.compressors.quantized_compressors.base import (
@@ -27,7 +26,7 @@ from compressed_tensors.quantization.lifecycle.forward import dequantize, quanti
 from torch import Tensor
 
 
-__all__ = ["pack_fp4_to_uint8", "unpack_fp4_from_uint8"]
+__all__ = ["pack_fp4_to_uint8", "unpack_fp4_from_uint8", "NVFP4PackedCompressor"]
 
 FLOAT_TO_E2M1 = [
     0.0,
@@ -61,6 +60,35 @@ class NVFP4PackedCompressor(BaseQuantizationCompressor):
             "weight_global_scale",
         )
 
+    def compression_param_info(
+        self,
+        weight_shape: torch.Size,
+        quantization_args: Optional[QuantizationArgs] = None,
+    ) -> Dict[str, Tuple[torch.Size, torch.dtype]]:
+        """
+        Creates a dictionary of expected shapes and dtypes for each compression
+            parameter used by the compressor
+
+        :param weight_shape: uncompressed weight shape
+        :param quantization_args: quantization parameters for the weight
+        :return: dictionary mapping compressed parameter names to shape and dtype
+        """
+        output = {
+            "weight_packed": (
+                torch.Size((weight_shape[0], weight_shape[1] // 2)),
+                torch.uint8,
+            ),
+        }
+        return output
+
+    def compress_scale(
+        self,
+        scale: Tensor,
+        quantization_args: QuantizationArgs,
+    ) -> Dict[str, torch.Tensor]:
+        assert quantization_args.scale_dtype is not None
+        return scale.to(quantization_args.scale_dtype)
+
     def compress_weight(
         self,
         weight: Tensor,
@@ -71,7 +99,6 @@ class NVFP4PackedCompressor(BaseQuantizationCompressor):
         zero_point: Optional[torch.Tensor] = None,
         g_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-
         quantized_weight = quantize(
             x=weight,
             scale=scale,
@@ -84,6 +111,9 @@ class NVFP4PackedCompressor(BaseQuantizationCompressor):
         if device is not None:
             weight_packed = weight_packed.to(device)
         compressed_dict["weight_packed"] = weight_packed
+        compressed_dict["weight_scale"] = self.compress_scale(
+            scale=scale, quantization_args=quantization_args
+        )
         return compressed_dict
 
     def decompress_weight(
@@ -91,13 +121,17 @@ class NVFP4PackedCompressor(BaseQuantizationCompressor):
         compressed_data: Dict[str, Tensor],
         quantization_args: Optional[QuantizationArgs] = None,
     ) -> torch.Tensor:
-
         weight = compressed_data["weight_packed"]
-        scale = compressed_data["weight_scale"]
         global_scale = compressed_data["weight_global_scale"]
+        scale = compressed_data["weight_scale"]
         m, n = weight.shape
         # TODO: use a user provided dequant dtype
         unpacked = unpack_fp4_from_uint8(weight, m, n * 2)
+
+        # decompress scale
+        scale = scale.to(unpacked.dtype)
+        compressed_data["weight_scale"] = torch.nn.Parameter(scale, requires_grad=False)
+
         decompressed_weight = dequantize(
             x_q=unpacked, scale=scale, global_scale=global_scale, dtype=unpacked.dtype
         )
@@ -105,6 +139,30 @@ class NVFP4PackedCompressor(BaseQuantizationCompressor):
         return decompressed_weight
 
 
+@BaseCompressor.register(name=CompressionFormat.mxfp4_pack_quantized.value)
+class MXFP4PackedCompressor(NVFP4PackedCompressor):
+    """
+    Alias for mxfp4 quantized models
+    """
+
+    def compress_scale(
+        self,
+        scale: Tensor,
+        quantization_args: QuantizationArgs,
+    ) -> Dict[str, torch.Tensor]:
+        assert quantization_args.scale_dtype is not None
+        scale_exp = 127 + torch.floor(torch.log2(scale)).to(torch.int32)
+        return scale_exp.to(quantization_args.scale_dtype)
+
+    def decompress_weight(
+        self,
+        compressed_data: Dict[str, Tensor],
+        quantization_args: Optional[QuantizationArgs] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("MXFP4 Decompression is currently not supported")
+
+
+@torch.compile(fullgraph=True, dynamic=True)
 def pack_fp4_to_uint8(x: torch.Tensor) -> torch.Tensor:
     """
     Packs a tensor with values in the fp4 range into uint8.
@@ -121,25 +179,25 @@ def pack_fp4_to_uint8(x: torch.Tensor) -> torch.Tensor:
     m, n = x.shape
     device = x.device
 
+    if n % 2 != 0:
+        raise ValueError(
+            "tensor must have an even number of columns for nvfp4 compression"
+        )
+
     # Create lookup table for FP4 values to indices
     # Map the absolute values to 0-7 indices
     kE2M1 = torch.tensor(FLOAT_TO_E2M1, device=device, dtype=x.dtype)
 
     # Find closest valid FP4 value index for each element
     abs_x = torch.abs(x)
-    abs_indices = torch.zeros_like(abs_x, dtype=torch.long)
-    for i, val in enumerate(kE2M1):
-        abs_indices = torch.where(torch.isclose(abs_x, val), i, abs_indices)
+    abs_diff_x = torch.abs(abs_x.unsqueeze(-1) - kE2M1)  # [m, n, 8]
+    abs_indices = torch.argmin(abs_diff_x, dim=-1)  # [m, n]
 
     # Apply sign bit (bit 3) to get final 4-bit representation
-    indices = abs_indices + (torch.signbit(x) << 3).to(torch.long)
+    indices = abs_indices + (torch.signbit(x).to(torch.long) << 3)
 
     # Reshape to prepare for packing pairs of values
     indices = indices.reshape(-1)
-
-    # Handle odd length by padding if necessary
-    if indices.numel() % 2 != 0:
-        indices = torch.cat([indices, torch.zeros(1, dtype=torch.long, device=device)])
 
     # Reshape to pair consecutive elements
     indices = indices.reshape(-1, 2)
@@ -154,14 +212,17 @@ kE2M1ToFloat = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
 )
 
+
 # reference: : https://github.com/vllm-project/vllm/pull/16362
+@torch.compile(fullgraph=True, dynamic=True)
 def unpack_fp4_from_uint8(
     a: torch.Tensor, m: int, n: int, dtype: Optional[torch.dtype] = torch.bfloat16
 ) -> torch.Tensor:
     """
     Unpacks uint8 values into fp4. Each uint8 consists of two fp4 values
-    (i.e. first four bits correspond to one fp4 value, last four corresond to a consecutive
-    fp4 value). The bits represent an index, which are mapped to an fp4 value.
+    (i.e. first four bits correspond to one fp4 value, last four correspond to a
+    consecutive fp4 value). The bits represent an index, which are mapped to an fp4
+    value.
 
     :param a: tensor to unpack
     :param m: original dim 0 size of the unpacked tensor
